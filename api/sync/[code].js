@@ -1,15 +1,15 @@
 // Vercel Serverless Function: /api/sync/[code]
 //
 // Speichert/liest die Sync-Daten über Upstash Redis (REST API).
-// Läuft automatisch mit, sobald dieses Repo auf Vercel deployt ist -
-// kein separater Server nötig.
+// Zusätzlich zu den Übungsdaten werden hier jetzt auch die Zeitzone
+// des Geräts und (optional) eine Web-Push-Subscription gespeichert,
+// damit der Cron-Job (siehe /api/cron/check-reminders) echte
+// Benachrichtigungen verschicken kann, auch wenn die App geschlossen ist.
 //
 // Voraussetzung: In den Vercel-Projekteinstellungen unter
-// "Environment Variables" müssen zwei Werte gesetzt sein:
+// "Environment Variables" müssen gesetzt sein:
 //   UPSTASH_REDIS_REST_URL
 //   UPSTASH_REDIS_REST_TOKEN
-// (beide bekommst du kostenlos von einer Upstash-Redis-Datenbank,
-// siehe Anleitung).
 
 const CODE_REGEX = /^[A-Za-z0-9]{4,32}$/;
 
@@ -57,7 +57,9 @@ module.exports = async (req, res) => {
         res.status(500).json({ error: "corrupt_data" });
         return;
       }
-      res.status(200).json(data);
+      // pushSubscriptions sind ein internes Server-Detail, nicht Teil der App-Daten
+      const { pushSubscriptions, ...publicData } = data;
+      res.status(200).json(publicData);
       return;
     }
 
@@ -70,14 +72,40 @@ module.exports = async (req, res) => {
           body = {};
         }
       }
-      const { stuecke = [], eintraege = [], sessions = [], termine = [] } = body || {};
+      body = body || {};
+
+      // Bestehenden Datensatz lesen, um pushSubscriptions nicht versehentlich
+      // zu löschen, wenn ein normaler "Hochladen"-Aufruf ohne diese Info kommt.
+      let existing = {};
+      try {
+        const existingResult = await redisCommand(["GET", key]);
+        if (existingResult.result) existing = JSON.parse(existingResult.result);
+      } catch {
+        existing = {};
+      }
+
+      const { stuecke = [], eintraege = [], sessions = [], termine = [], timezone, pushSubscription, removePushEndpoint } = body;
+
+      let pushSubscriptions = Array.isArray(existing.pushSubscriptions) ? existing.pushSubscriptions : [];
+
+      if (pushSubscription && pushSubscription.endpoint) {
+        pushSubscriptions = pushSubscriptions.filter(s => s.endpoint !== pushSubscription.endpoint);
+        pushSubscriptions.push(pushSubscription);
+      }
+      if (removePushEndpoint) {
+        pushSubscriptions = pushSubscriptions.filter(s => s.endpoint !== removePushEndpoint);
+      }
+
       const payload = {
         stuecke,
         eintraege,
         sessions,
         termine,
+        timezone: timezone || existing.timezone || "UTC",
+        pushSubscriptions,
         updatedAt: new Date().toISOString(),
       };
+
       await redisCommand(["SET", key, JSON.stringify(payload)]);
       res.status(200).json({ ok: true, updatedAt: payload.updatedAt });
       return;
